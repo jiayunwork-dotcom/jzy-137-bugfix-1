@@ -1,0 +1,11 @@
+node_modules/
+dist/
+data/
+test/
+scratch/
+coverage/
+*.db
+*.db-shm
+*.db-wal
+.git/
+.DS_Store
