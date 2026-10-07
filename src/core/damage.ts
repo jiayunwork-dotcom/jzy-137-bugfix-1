@@ -16,8 +16,12 @@ import type { RawCycle } from './rainflow';
  *
  * Goodman is applied only for a tensile (positive) mean. For a compressive
  * (mean <= 0) mean the amplitude is NOT enlarged, so S stays equal to the
- * amplitude. A mean meeting/exceeding the tensile strength is non-physical and
- * raises an error rather than producing an infinite/negative life.
+ * amplitude.
+ *
+ * A mean meeting/exceeding the tensile strength is a STATIC-STRENGTH FAILURE:
+ * the remaining life is zero, so the Miner damage 1/N is infinite. Such cycles
+ * are kept and scored with damage +Infinity (and flagged `exceedsStrength`)
+ * rather than being rejected or fudged into a finite number — see README.
  */
 
 export interface DamageInput {
@@ -51,7 +55,26 @@ export function validateMaterial(cfg: JobConfig): void {
   }
 }
 
-/** Effective (mean-corrected) amplitude for one cycle. */
+/**
+ * True when a cycle mean meets/exceeds the ultimate tensile strength under
+ * Goodman — a static-strength failure. Always false for correction 'none'
+ * (no strength limit is defined there).
+ */
+export function exceedsStaticStrength(mean: number, cfg: DamageInput): boolean {
+  return (
+    cfg.correction === 'goodman' &&
+    cfg.ultimateTensileStrength !== undefined &&
+    mean >= cfg.ultimateTensileStrength
+  );
+}
+
+/**
+ * Effective (mean-corrected) amplitude for one cycle.
+ *
+ * Returns +Infinity when the Goodman mean meets/exceeds the tensile strength:
+ * the corrected amplitude grows without bound as the mean approaches UTS, and
+ * beyond it the formula has no physical meaning — zero remaining life.
+ */
 export function effectiveAmplitude(
   amplitude: number,
   mean: number,
@@ -61,11 +84,7 @@ export function effectiveAmplitude(
     const uts = cfg.ultimateTensileStrength as number;
     if (mean > 0) {
       const denom = 1 - mean / uts;
-      if (denom <= 0) {
-        throw new ConfigError(
-          `cycle mean ${mean} meets/exceeds ultimate tensile strength ${uts}; Goodman life undefined`,
-        );
-      }
+      if (denom <= 0) return Infinity; // static failure: zero remaining life
       return amplitude / denom;
     }
     // Compressive (or zero) mean: do not enlarge the amplitude.
@@ -74,7 +93,10 @@ export function effectiveAmplitude(
   return amplitude;
 }
 
-/** Damage for a single cycle application, including the 0.5 half-cycle weight. */
+/**
+ * Damage for a single cycle application, including the 0.5 half-cycle weight.
+ * +Infinity when the effective amplitude is infinite (static failure).
+ */
 export function cycleDamage(
   amplitude: number,
   mean: number,
@@ -89,10 +111,17 @@ export function cycleDamage(
 export function scoreCycle(raw: RawCycle, cfg: JobConfig): Cycle {
   const amplitude = raw.range / 2;
   const damage = cycleDamage(amplitude, raw.mean, raw.count, cfg);
-  return { amplitude, mean: raw.mean, count: raw.count, damage, kind: raw.kind };
+  return {
+    amplitude,
+    mean: raw.mean,
+    count: raw.count,
+    damage,
+    kind: raw.kind,
+    exceedsStrength: exceedsStaticStrength(raw.mean, cfg),
+  };
 }
 
-export function sumDamage(cycles: readonly Cycle[]): number {
+export function sumDamage(cycles: readonly { damage: number }[]): number {
   let total = 0;
   for (const c of cycles) total += c.damage;
   return total;

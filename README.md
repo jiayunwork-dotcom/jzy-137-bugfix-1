@@ -120,10 +120,52 @@ X ≥ Y  且  Y ≤ Z
 - 不修正：有效幅值 `S = S_a`。
 - Goodman：`S = S_a / (1 − S_m/UTS)`，**仅当均值为拉（>0）**；
   均值为压（≤0）时**不放大幅值**，`S = S_a`。
-  当 `S_m ≥ UTS` 时寿命无定义，返回明确错误。
+  当 `S_m ≥ UTS` 时按**静强度失效**处理，见下节。
 - 单次损伤 `D = count·S^m / C`，`count` 全循环为 1、半循环为 0.5。
 - 累计损伤为逐循环损伤之和（Miner 线性）。查询时由已存循环行重新求和，
   与落库结果始终一致。
+
+---
+
+## 静强度失效（Goodman 均值 ≥ UTS）：设计取舍
+
+过载工况下会出现均值达到甚至超过抗拉强度的循环，此时 Goodman 寿命
+**没有定义**（`1 − S_m/UTS ≤ 0`）。这类数据**必须进得来**：循环照常计数、
+照常落库、序号照常推进、收尾照常完成，同时在结果里被明确标出。
+
+**本实现的选择：Miner 损伤记 +∞，不封顶，接口显式表达。**
+
+- 物理含义：均值达到静态强度即静载失效，剩余寿命 `N = 0`，Miner 损伤
+  `D = count/N = +∞`。这不是凭空造一个数，而是 Miner 公式在 `N=0` 处的
+  本来取值。
+- 这样的循环带上 `exceedsStrength: true`，`damage = +∞`；其幅值、均值、
+  计数按实测记录，不做任何改动。任一循环越界后，作业级
+  `exceedsStrength` 为 true，`totalDamage = +∞`（**不封顶**）。
+- JSON 无法表示 Infinity（`JSON.stringify` 会把它变成 `null`，等于把越界
+  悄悄抹掉）。因此 HTTP 响应里 `damage` / `totalDamage` 的类型是
+  `number | "Infinity"`：越界时编码为字符串 `"Infinity"`，客户端可用
+  `Number("Infinity")` / `float("Infinity")` 还原。服务内部一律用
+  `number`（`Infinity`）计算；SQLite REAL 列可无损存取 Inf，重启续算、
+  幂等重发、重复收尾的结果与不中断完全一致。
+- `exceedsStrength` 不落库：它纯由 `(mean, 作业配置)` 决定
+  （`correction === 'goodman' && mean >= UTS`），配置不可变，读取时推导
+  即可，省一次 schema 迁移且不会与已存损伤漂移。
+
+**候选路线与代价：**
+
+1. **整块拒收（旧行为）**：追加/收尾时抛错 → 400。数据进不来；序号期望
+   不前移，重发仍是 400、发下一序号变 409；收尾失败则作业永远 open。✗
+2. **记 0 / 记一个有限"正常"值 / 退回不修正幅值**：越界被抹平，累计损伤
+   失真，等于造假。✗
+3. **封顶到 1（D=1 即失效）**：JSON 友好、"D=1 即失效"直观；但 1.0 本身
+   就是个"看着正常的有限小数"，且丢失信息——分不出刚好越界与远超，也
+   分不出静强度失效与 Miner 累积失效（仍需标志位）。✗
+4. **+∞ + 显式标志 + `"Infinity"` 字符串编码（本实现）**：无信息损失、
+   重启/幂等天然一致；代价是 JSON 类型不稳定（`number | "Infinity"`），
+   客户端需要特判一次。✓
+
+不修正（`none`）作业没有强度上限的概念，永不越界，行为完全不变；
+未越界的 Goodman 循环幅值、均值、损伤与旧实现逐位相同。
 
 ---
 
@@ -162,12 +204,18 @@ X ≥ Y  且  Y ≤ Z
   "blocks": 12,
   "lastSequence": 12,
   "sampleCount": 30582,
+  "exceedsStrength": false,
   "cycles": [
-    { "amplitude": 20, "mean": 5, "count": 1, "damage": 0.00008, "kind": "full" }
+    { "amplitude": 20, "mean": 5, "count": 1, "damage": 0.00008, "kind": "full", "exceedsStrength": false }
   ],
   "totalDamage": 0.00042
 }
 ```
+
+- `exceedsStrength`（循环级与作业级）：该循环均值是否达到/超过抗拉强度
+  （仅 Goodman 作业可能出现 true），见"静强度失效"一节。
+- `damage` / `totalDamage` 类型为 `number | "Infinity"`：越界循环的损伤
+  与越界后的累计损伤编码为字符串 `"Infinity"`。
 
 ### 序号与错误约定
 
@@ -227,6 +275,14 @@ curl -s -X POST localhost:3000/jobs/<id>/finalize
   - 追加中途“重启”（关闭后用同一 SQLite 文件重开）继续追加，结果与不中断一致；
   - 非数组 / NaN / Infinity / 空块 / 200001 点报错，正好 200000 点接受；
   - Goodman 在全压均值时与不修正结果相同。
+- 静强度失效（Goodman 均值 ≥ UTS）：
+  - 含越界循环的块被收下、序号推进、重发幂等；越界半循环不再卡住收尾；
+  - 越界循环 `damage = +∞` 且 `exceedsStrength: true`，未越界循环逐位不变；
+  - 含越界的时程在逐点 / 随机切块 / 一整块下结果一致（30 组随机）；
+  - 越界后重启续算与不中断一致（Inf 经 SQLite 往返无损）；
+  - 同一信号在 `none` 作业下不越界、保持有限；
+  - HTTP 端到端：`"Infinity"` 编码、标志位、序号推进与幂等重发。
 - `test/damage.test.ts`：整段乘 2 时幅值/均值乘 2、损伤乘 `2^m`；整体平移常数
-  时均值平移、幅值与损伤不变；整体取负时幅值不变、均值取负。
+  时均值平移、幅值与损伤不变；整体取负时幅值不变、均值取负；越界循环记
+  +∞ 并打标志。
 - `test/http.test.ts`：Fastify `inject` 端到端覆盖 201/200/400/404/409 与分块追加。

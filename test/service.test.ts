@@ -33,7 +33,13 @@ function approxCycles(actual: Cycle[], expected: Cycle[]): void {
     expect(a.mean, `cycle ${i} mean`).toBeCloseTo(e.mean, 9);
     expect(a.count, `cycle ${i} count`).toBeCloseTo(e.count, 12);
     expect(a.kind, `cycle ${i} kind`).toBe(e.kind);
-    expect(a.damage, `cycle ${i} damage`).toBeCloseTo(e.damage, 10);
+    expect(a.exceedsStrength, `cycle ${i} exceedsStrength`).toBe(e.exceedsStrength);
+    // toBeCloseTo cannot compare infinities (Inf - Inf = NaN)
+    if (Number.isFinite(e.damage)) {
+      expect(a.damage, `cycle ${i} damage`).toBeCloseTo(e.damage, 10);
+    } else {
+      expect(a.damage, `cycle ${i} damage`).toBe(e.damage);
+    }
   }
 }
 
@@ -292,5 +298,179 @@ describe('Goodman through the service', () => {
     for (let i = 0; i < rn.cycles.length; i++) {
       expect(rg.cycles[i]!.damage).toBeCloseTo(rn.cycles[i]!.damage, 12);
     }
+  });
+});
+
+describe('static-strength overload (Goodman mean >= UTS)', () => {
+  const cfg = goodmanConfig(400); // C=1e12, m=3, UTS=400, hysteresis=0
+
+  it('accepts a block containing overload cycles and lets the sequence advance', () => {
+    // The reported failure, minimal example 1.
+    const { service, store } = makeService();
+    const id = service.createJob(cfg);
+
+    service.appendBlock(id, 1, [0, 100, 0, 100, 0]);
+    const after1 = service.getResult(id);
+    expect(after1.cycles).toHaveLength(1);
+    expect(after1.exceedsStrength).toBe(false);
+
+    // Used to be rejected with a 400 and wedged the job; now accepted.
+    const after2 = service.appendBlock(id, 2, [450, 500, 450, 500, 450, 0, 100]);
+    expect(after2.lastSequence).toBe(2);
+    expect(after2.cycles).toHaveLength(3);
+
+    const overload = after2.cycles.filter((c) => c.exceedsStrength);
+    expect(overload).toHaveLength(1);
+    expect(overload[0]!.amplitude).toBeCloseTo(25, 12); // range 50
+    expect(overload[0]!.mean).toBeCloseTo(475, 12);
+    expect(overload[0]!.damage).toBe(Infinity);
+    // Untouched cycles keep their exact Goodman damage.
+    const normal = after2.cycles.filter((c) => !c.exceedsStrength);
+    expect(normal).toHaveLength(2);
+    for (const c of normal) {
+      expect(c.amplitude).toBeCloseTo(50, 12);
+      expect(c.mean).toBeCloseTo(50, 12);
+      expect(c.damage).toBeCloseTo(Math.pow(50 / (1 - 50 / 400), 3) / 1e12, 15);
+    }
+    expect(after2.totalDamage).toBe(Infinity);
+    expect(after2.exceedsStrength).toBe(true);
+
+    // The next sequence number is accepted (used to answer 409).
+    service.appendBlock(id, 3, [0, 200, 0]);
+    expect(service.getResult(id).lastSequence).toBe(3);
+
+    const done = service.finalize(id);
+    expect(done.status).toBe('finalized');
+    const ref = referencePipeline([0, 100, 0, 100, 0, 450, 500, 450, 500, 450, 0, 100, 0, 200, 0], cfg);
+    approxCycles(done.cycles, ref.finalized);
+    store.close();
+  });
+
+  it('treats a re-sent overload block as idempotent and still rejects a changed payload', () => {
+    const { service, store } = makeService();
+    const id = service.createJob(cfg);
+    service.appendBlock(id, 1, [0, 100, 0, 100, 0]);
+    service.appendBlock(id, 2, [450, 500, 450, 500, 450, 0, 100]);
+    const before = service.getResult(id);
+
+    // Identical re-submission of the block that used to be 400-rejected.
+    const again = service.appendBlock(id, 2, [450, 500, 450, 500, 450, 0, 100]);
+    expect(again.blocks).toBe(2);
+    expect(again.cycles.length).toBe(before.cycles.length);
+    expect(again.sampleCount).toBe(before.sampleCount);
+    expect(again.totalDamage).toBe(Infinity);
+
+    // Same sequence, different content is still a conflict.
+    expect(() => service.appendBlock(id, 2, [1, 2, 3])).toThrow(ConflictError);
+    store.close();
+  });
+
+  it('finalizes even when a residue half cycle exceeds the strength', () => {
+    // The reported failure, minimal example 2: finalize used to answer 400
+    // and the job stayed open forever.
+    const { service, store } = makeService();
+    const id = service.createJob(cfg);
+    service.appendBlock(id, 1, [300, 500]);
+    const done = service.finalize(id);
+    expect(done.status).toBe('finalized');
+    expect(done.cycles).toHaveLength(1);
+    const half = done.cycles[0]!;
+    expect(half.kind).toBe('half');
+    expect(half.amplitude).toBeCloseTo(100, 12);
+    expect(half.mean).toBeCloseTo(400, 12);
+    expect(half.exceedsStrength).toBe(true);
+    expect(half.damage).toBe(Infinity);
+    expect(done.totalDamage).toBe(Infinity);
+    expect(done.exceedsStrength).toBe(true);
+
+    // Finalizing again stays idempotent.
+    const twice = service.finalize(id);
+    expect(twice.cycles).toHaveLength(1);
+    expect(twice.totalDamage).toBe(Infinity);
+    store.close();
+  });
+
+  it('is chunk-invariant: point-by-point, random cuts and one block agree with overloads present', () => {
+    const rnd = mulberry32(4242);
+    let sawOverload = 0;
+    for (let trial = 0; trial < 30; trial++) {
+      const n = 6 + Math.floor(rnd() * 120);
+      // Offset the walk so that many cycle means land near/above UTS.
+      const raw = randomWalk(rnd, n, 260).map((x) => x + 380);
+      const config: JobConfig = { ...cfg, hysteresis: rnd() < 0.5 ? 0 : rnd() * 30 };
+      const ref = referencePipeline(raw, config);
+      if (ref.finalized.some((c) => c.exceedsStrength)) sawOverload++;
+
+      const w = makeService();
+      const jw = w.service.createJob(config);
+      w.service.appendBlock(jw, 1, raw);
+      const whole = w.service.finalize(jw);
+      w.store.close();
+
+      const p = makeService();
+      const jp = p.service.createJob(config);
+      feedChunks(p.service, jp, raw, raw.map((_, i) => i + 1));
+      const pbp = p.service.finalize(jp);
+      p.store.close();
+
+      const c = makeService();
+      const jc = c.service.createJob(config);
+      feedChunks(c.service, jc, raw, randomCuts(rnd, n));
+      const chunked = c.service.finalize(jc);
+      c.store.close();
+
+      approxCycles(whole.cycles, ref.finalized);
+      approxCycles(pbp.cycles, ref.finalized);
+      approxCycles(chunked.cycles, ref.finalized);
+
+      const refTotal = ref.finalized.reduce((s, x) => s + x.damage, 0);
+      for (const r of [whole, pbp, chunked]) {
+        expect(r.exceedsStrength).toBe(ref.finalized.some((x) => x.exceedsStrength));
+        if (Number.isFinite(refTotal)) expect(r.totalDamage).toBeCloseTo(refTotal, 9);
+        else expect(r.totalDamage).toBe(refTotal);
+      }
+    }
+    // The test is only meaningful if overloads actually occurred.
+    expect(sawOverload).toBeGreaterThan(0);
+  });
+
+  it('survives a restart after an overload block was committed', () => {
+    const raw = [0, 100, 0, 100, 0, 450, 500, 450, 500, 450, 0, 100, 0, 200, 0];
+    const { service, dbPath } = makeService();
+    const id = service.createJob(cfg);
+    service.appendBlock(id, 1, raw.slice(0, 5));
+    service.appendBlock(id, 2, raw.slice(5, 12)); // commits overload cycles
+    service.store.close();
+
+    // Restart on the same file: infinite damage must round-trip through SQLite.
+    const store2 = new JobStore(dbPath);
+    const service2 = new JobService(store2);
+    const mid = service2.getResult(id);
+    expect(mid.status).toBe('open');
+    expect(mid.totalDamage).toBe(Infinity);
+    expect(mid.exceedsStrength).toBe(true);
+    expect(mid.cycles.filter((c) => c.exceedsStrength)).toHaveLength(1);
+
+    service2.appendBlock(id, 3, raw.slice(12));
+    const done = service2.finalize(id);
+
+    const ref = referencePipeline(raw, cfg);
+    approxCycles(done.cycles, ref.finalized);
+    expect(done.totalDamage).toBe(Infinity);
+    store2.close();
+  });
+
+  it('leaves correction-none jobs untouched by the same overload signal', () => {
+    const { service, store } = makeService();
+    const id = service.createJob(baseConfig); // correction 'none', no UTS
+    service.appendBlock(id, 1, [300, 500]);
+    const done = service.finalize(id);
+    expect(done.cycles).toHaveLength(1);
+    const half = done.cycles[0]!;
+    expect(half.exceedsStrength).toBe(false);
+    expect(half.damage).toBeCloseTo((0.5 * Math.pow(100, 3)) / 1e12, 15);
+    expect(done.exceedsStrength).toBe(false);
+    expect(Number.isFinite(done.totalDamage)).toBe(true);
+    store.close();
   });
 });

@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { ConflictError, JobConfig, JobResult, Cycle } from '../core/types';
 import { PeakValleyExtractor, pushBlock } from '../core/peakvalley';
 import { RainflowAccumulator, pushTurningPoints } from '../core/rainflow';
-import { scoreCycle, sumDamage, validateMaterial } from '../core/damage';
+import { exceedsStaticStrength, scoreCycle, sumDamage, validateMaterial } from '../core/damage';
 import { JobStore, StoredCycle } from '../store/sqliteStore';
 
 /** Stable checksum so a repeated (sequence, payload) is recognised as idempotent. */
@@ -10,13 +10,19 @@ export function checksumPoints(points: readonly number[]): string {
   return createHash('sha256').update(points.join(',')).digest('hex');
 }
 
-function toCycle(c: StoredCycle): Cycle {
+/**
+ * Rehydrate a stored cycle row. `exceedsStrength` is not persisted: it is a
+ * pure function of (mean, immutable job config), so it is re-derived on read
+ * and can never drift from the stored damage.
+ */
+function toCycle(c: StoredCycle, config: JobConfig): Cycle {
   return {
     amplitude: c.amplitude,
     mean: c.mean,
     count: c.count,
     damage: c.damage,
     kind: c.kind,
+    exceedsStrength: exceedsStaticStrength(c.mean, config),
   };
 }
 
@@ -129,7 +135,7 @@ export class JobService {
   getResult(jobId: string): JobResult {
     const state = this.store.getEngineState(jobId);
     const stored = this.store.listCycles(jobId);
-    const cycles = stored.map(toCycle);
+    const cycles = stored.map((c) => toCycle(c, state.config));
     return {
       jobId,
       status: state.status,
@@ -139,6 +145,7 @@ export class JobService {
       cycles,
       // recompute from stored cycles so the answer never drifts from the rows
       totalDamage: sumDamage(cycles),
+      exceedsStrength: cycles.some((c) => c.exceedsStrength),
     };
   }
 }

@@ -3,6 +3,7 @@ import {
   ConfigError,
   ConflictError,
   JobConfig,
+  JobResult,
   NotFoundError,
   ValidationError,
 } from '../core/types';
@@ -19,6 +20,28 @@ interface CreateJobBody {
 interface AppendBody {
   sequence?: number;
   values?: unknown;
+}
+
+/**
+ * JSON cannot represent Infinity (JSON.stringify would emit null, silently
+ * hiding a static-failure result). Damage values are finite or +Infinity by
+ * construction, so any non-finite damage is encoded as the string "Infinity";
+ * clients can restore it with Number("Infinity") / float("Infinity").
+ */
+function encodeDamage(d: number): number | 'Infinity' {
+  return Number.isFinite(d) ? d : 'Infinity';
+}
+
+/** Wire form of a JobResult: damages encoded as number | "Infinity". */
+function encodeResult(result: JobResult): Omit<JobResult, 'cycles' | 'totalDamage'> & {
+  cycles: Array<Omit<JobResult['cycles'][number], 'damage'> & { damage: number | 'Infinity' }>;
+  totalDamage: number | 'Infinity';
+} {
+  return {
+    ...result,
+    cycles: result.cycles.map((c) => ({ ...c, damage: encodeDamage(c.damage) })),
+    totalDamage: encodeDamage(result.totalDamage),
+  };
 }
 
 export function registerRoutes(app: FastifyInstance, service: JobService): void {
@@ -41,18 +64,18 @@ export function registerRoutes(app: FastifyInstance, service: JobService): void 
     const { id } = req.params as { id: string };
     const body = (req.body ?? {}) as AppendBody;
     const result = service.appendBlock(id, body.sequence as number, body.values);
-    return reply.code(200).send(result);
+    return reply.code(200).send(encodeResult(result));
   });
 
   app.get('/jobs/:id', async (req) => {
     const { id } = req.params as { id: string };
-    return service.getResult(id);
+    return encodeResult(service.getResult(id));
   });
 
   app.post('/jobs/:id/finalize', async (req, reply) => {
     const { id } = req.params as { id: string };
     const result = service.finalize(id);
-    return reply.code(200).send(result);
+    return reply.code(200).send(encodeResult(result));
   });
 
   // Central error mapping.

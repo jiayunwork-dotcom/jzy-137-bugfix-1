@@ -154,4 +154,104 @@ describe('HTTP API', () => {
     });
     expect(same.statusCode).toBe(200);
   });
+
+  it('accepts overload blocks, advances the sequence and marks them explicitly', async () => {
+    // Reported failure, minimal example 1: C=1e12, m=3, Goodman, UTS=400.
+    const b = app();
+    const created = await b.app.inject({
+      method: 'POST',
+      url: '/jobs',
+      payload: { C: 1e12, m: 3, correction: 'goodman', ultimateTensileStrength: 400, hysteresis: 0 },
+    });
+    expect(created.statusCode).toBe(201);
+    const { jobId } = created.json() as { jobId: string };
+
+    const r1 = await b.app.inject({
+      method: 'POST',
+      url: `/jobs/${jobId}/blocks`,
+      payload: { sequence: 1, values: [0, 100, 0, 100, 0] },
+    });
+    expect(r1.statusCode).toBe(200);
+    expect(r1.json().exceedsStrength).toBe(false);
+
+    // The block whose cycle means swing between 450 and 500: used to be a 400.
+    const r2 = await b.app.inject({
+      method: 'POST',
+      url: `/jobs/${jobId}/blocks`,
+      payload: { sequence: 2, values: [450, 500, 450, 500, 450, 0, 100] },
+    });
+    expect(r2.statusCode).toBe(200);
+    const body2 = r2.json();
+    expect(body2.lastSequence).toBe(2);
+    expect(body2.exceedsStrength).toBe(true);
+    expect(body2.totalDamage).toBe('Infinity');
+    const flagged = body2.cycles.filter((c: { exceedsStrength: boolean }) => c.exceedsStrength);
+    expect(flagged.length).toBeGreaterThan(0);
+    for (const c of flagged) {
+      expect(c.damage).toBe('Infinity');
+      expect(typeof c.amplitude).toBe('number');
+      expect(typeof c.mean).toBe('number');
+    }
+    // Untouched cycles still carry plain finite numbers.
+    const plain = body2.cycles.filter((c: { exceedsStrength: boolean }) => !c.exceedsStrength);
+    for (const c of plain) expect(typeof c.damage).toBe('number');
+
+    // The next sequence goes through (used to be a 409)...
+    const r3 = await b.app.inject({
+      method: 'POST',
+      url: `/jobs/${jobId}/blocks`,
+      payload: { sequence: 3, values: [0, 200, 0] },
+    });
+    expect(r3.statusCode).toBe(200);
+    expect(r3.json().lastSequence).toBe(3);
+
+    // ...and re-sending the overload block verbatim is idempotent (was a 400).
+    const dup = await b.app.inject({
+      method: 'POST',
+      url: `/jobs/${jobId}/blocks`,
+      payload: { sequence: 2, values: [450, 500, 450, 500, 450, 0, 100] },
+    });
+    expect(dup.statusCode).toBe(200);
+    expect(dup.json().blocks).toBe(3);
+    expect(dup.json().cycles.length).toBe(r3.json().cycles.length);
+
+    const fin = await b.app.inject({ method: 'POST', url: `/jobs/${jobId}/finalize` });
+    expect(fin.statusCode).toBe(200);
+    expect(fin.json().status).toBe('finalized');
+    expect(fin.json().totalDamage).toBe('Infinity');
+
+    const get = await b.app.inject({ method: 'GET', url: `/jobs/${jobId}` });
+    expect(get.json().exceedsStrength).toBe(true);
+    expect(get.json().totalDamage).toBe('Infinity');
+  });
+
+  it('finalizes a job whose residue half cycle exceeds the strength', async () => {
+    // Reported failure, minimal example 2: finalize used to answer 400 and
+    // the job stayed open forever.
+    const b = app();
+    const created = await b.app.inject({
+      method: 'POST',
+      url: '/jobs',
+      payload: { C: 1e12, m: 3, correction: 'goodman', ultimateTensileStrength: 400, hysteresis: 0 },
+    });
+    const { jobId } = created.json() as { jobId: string };
+
+    const r1 = await b.app.inject({
+      method: 'POST',
+      url: `/jobs/${jobId}/blocks`,
+      payload: { sequence: 1, values: [300, 500] },
+    });
+    expect(r1.statusCode).toBe(200);
+
+    const fin = await b.app.inject({ method: 'POST', url: `/jobs/${jobId}/finalize` });
+    expect(fin.statusCode).toBe(200);
+    const done = fin.json();
+    expect(done.status).toBe('finalized');
+    expect(done.cycles).toHaveLength(1);
+    expect(done.cycles[0].kind).toBe('half');
+    expect(done.cycles[0].mean).toBeCloseTo(400, 9);
+    expect(done.cycles[0].exceedsStrength).toBe(true);
+    expect(done.cycles[0].damage).toBe('Infinity');
+    expect(done.totalDamage).toBe('Infinity');
+  });
 });

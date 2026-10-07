@@ -42,10 +42,21 @@ export interface Cycle {
   mean: number;
   /** 1 for a full cycle, 0.5 for a residue half cycle. */
   count: number;
-  /** Palmgren-Miner damage contributed by this cycle. */
+  /**
+   * Palmgren-Miner damage contributed by this cycle. Finite for ordinary
+   * cycles; +Infinity for a cycle whose mean meets/exceeds the ultimate
+   * tensile strength under Goodman (static failure: zero remaining life,
+   * so 1/N is infinite). See `exceedsStrength`.
+   */
   damage: number;
   /** 'full' while streaming; 'half' is only produced at finalization. */
   kind: 'full' | 'half';
+  /**
+   * True when this cycle's mean meets/exceeds the ultimate tensile strength
+   * of a Goodman job (static-strength failure). Always false for
+   * correction 'none'.
+   */
+  exceedsStrength: boolean;
 }
 
 export interface JobResult {
@@ -57,8 +68,13 @@ export interface JobResult {
   /** Number of raw samples accepted so far. */
   sampleCount: number;
   cycles: Cycle[];
-  /** Sum of per-cycle damage (computed from the stored cycles). */
+  /**
+   * Sum of per-cycle damage (computed from the stored cycles). +Infinity once
+   * any cycle exceeds static strength; the total is NOT capped.
+   */
   totalDamage: number;
+  /** True when any counted cycle exceeds static strength (see Cycle). */
+  exceedsStrength: boolean;
 }
 
 export class ConfigError extends Error {}

@@ -47,10 +47,32 @@ describe('Goodman mean-stress correction', () => {
     expect(effectiveAmplitude(100, 0, cfg)).toBe(100);
   });
 
-  it('raises when mean reaches the tensile strength', () => {
+  it('scores a mean at/above the tensile strength as static failure (infinite damage)', () => {
     const cfg = goodmanConfig(1000);
-    expect(() => effectiveAmplitude(100, 1000, cfg)).toThrow(ConfigError);
-    expect(() => effectiveAmplitude(100, 1200, cfg)).toThrow(ConfigError);
+    // No throw: the cycle is kept and scored with +Infinity damage.
+    expect(effectiveAmplitude(100, 1000, cfg)).toBe(Infinity);
+    expect(effectiveAmplitude(100, 1200, cfg)).toBe(Infinity);
+    expect(cycleDamage(100, 1000, 1, cfg)).toBe(Infinity);
+    expect(cycleDamage(100, 1200, 0.5, cfg)).toBe(Infinity);
+  });
+
+  it('flags cycles whose mean meets/exceeds the tensile strength', () => {
+    const cfg = goodmanConfig(1000);
+    const over = scoreCycle({ range: 200, mean: 1000, count: 1, kind: 'full' }, cfg);
+    expect(over.exceedsStrength).toBe(true);
+    expect(over.damage).toBe(Infinity);
+    // amplitude / mean / count are recorded as counted, not altered
+    expect(over.amplitude).toBe(100);
+    expect(over.mean).toBe(1000);
+
+    const under = scoreCycle({ range: 200, mean: 999.9, count: 1, kind: 'full' }, cfg);
+    expect(under.exceedsStrength).toBe(false);
+    expect(Number.isFinite(under.damage)).toBe(true);
+
+    // correction 'none' has no strength limit: never flagged, stays finite
+    const none = scoreCycle({ range: 200, mean: 5000, count: 1, kind: 'full' }, baseConfig);
+    expect(none.exceedsStrength).toBe(false);
+    expect(Number.isFinite(none.damage)).toBe(true);
   });
 
   it('requires ultimateTensileStrength', () => {
