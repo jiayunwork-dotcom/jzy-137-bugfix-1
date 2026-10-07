@@ -17,6 +17,7 @@ function toCycle(c: StoredCycle): Cycle {
     count: c.count,
     damage: c.damage,
     kind: c.kind,
+    overload: c.overload,
   };
 }
 
@@ -66,6 +67,9 @@ export class JobService {
 
     const turning = pushBlock(pv, points);
     const rawFull = pushTurningPoints(rf, turning);
+    // Overload cycles (Goodman mean >= UTS) are scored, not rejected: they are
+    // stored flagged `overload` with damage equal to their count weight, so the
+    // block always lands and the sequence stream keeps moving.
     const newCycles = rawFull.map((r) => {
       const scored = scoreCycle(r, state.config);
       return {
@@ -74,6 +78,7 @@ export class JobService {
         count: scored.count,
         damage: scored.damage,
         kind: scored.kind as 'full',
+        overload: scored.overload,
       };
     });
 
@@ -119,6 +124,7 @@ export class JobService {
       count: c.count,
       damage: c.damage,
       kind: c.kind,
+      overload: c.overload,
     }));
     const totalDamage = state.totalDamage + sumDamage(added);
 

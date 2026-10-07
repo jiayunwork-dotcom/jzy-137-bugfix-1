@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import Database from 'better-sqlite3';
 import { JobService } from '../src/service/jobService';
 import { JobStore } from '../src/store/sqliteStore';
 import {
@@ -33,6 +34,7 @@ function approxCycles(actual: Cycle[], expected: Cycle[]): void {
     expect(a.mean, `cycle ${i} mean`).toBeCloseTo(e.mean, 9);
     expect(a.count, `cycle ${i} count`).toBeCloseTo(e.count, 12);
     expect(a.kind, `cycle ${i} kind`).toBe(e.kind);
+    expect(a.overload, `cycle ${i} overload`).toBe(e.overload);
     expect(a.damage, `cycle ${i} damage`).toBeCloseTo(e.damage, 10);
   }
 }
@@ -292,5 +294,184 @@ describe('Goodman through the service', () => {
     for (let i = 0; i < rn.cycles.length; i++) {
       expect(rg.cycles[i]!.damage).toBeCloseTo(rn.cycles[i]!.damage, 12);
     }
+  });
+});
+
+describe('Goodman overload (mean meets/exceeds UTS)', () => {
+  const cfg = () => goodmanConfig(400); // C=1e12, m=3, UTS=400, hysteresis=0
+  // The colleague's stuck history: normal 0..100 cycles, then an excursion
+  // oscillating between 450 and 500 (cycle mean 475 >= UTS 400).
+  const BLOCK1 = [0, 100, 0, 100, 0];
+  const OVERLOAD_BLOCK = [450, 500, 450, 500, 450, 0, 100];
+  const BLOCK3 = [0, 50, 0];
+
+  it('accepts a block containing an overload cycle and keeps the sequence moving', () => {
+    const { service, store } = makeService();
+    const id = service.createJob(cfg());
+    service.appendBlock(id, 1, BLOCK1);
+    const r2 = service.appendBlock(id, 2, OVERLOAD_BLOCK); // previously a 400
+
+    // the overload cycle is visible in the query, flagged, with finite damage
+    const overload = r2.cycles.filter((c) => c.overload);
+    expect(overload).toHaveLength(1);
+    expect(overload[0]!.kind).toBe('full');
+    expect(overload[0]!.mean).toBeCloseTo(475, 12);
+    expect(overload[0]!.amplitude).toBeCloseTo(25, 12);
+    expect(overload[0]!.damage).toBe(1); // count weight: Miner failure sum
+
+    // the non-overload cycles are scored exactly as before (plain Goodman)
+    const normal = r2.cycles.filter((c) => !c.overload);
+    expect(normal).toHaveLength(2);
+    const want = Math.pow(50 / (1 - 50 / 400), 3) / 1e12;
+    for (const c of normal) {
+      expect(c.amplitude).toBeCloseTo(50, 12);
+      expect(c.mean).toBeCloseTo(50, 12);
+      expect(c.damage).toBeCloseTo(want, 18);
+    }
+
+    // the stream is not wedged: the next sequence is accepted, finalize works
+    service.appendBlock(id, 3, BLOCK3);
+    expect(service.getResult(id).lastSequence).toBe(3);
+    const done = service.finalize(id);
+    expect(done.status).toBe('finalized');
+    expect(done.totalDamage).toBeGreaterThan(1); // overload pushed it past failure
+    expect(Number.isFinite(done.totalDamage)).toBe(true);
+    store.close();
+  });
+
+  it('finalizes cleanly when a residue half cycle overloads (mean exactly UTS)', () => {
+    const { service, store } = makeService();
+    const id = service.createJob(cfg());
+    service.appendBlock(id, 1, [300, 500]); // accepted; nothing counted yet
+    const done = service.finalize(id); // previously a 400, job stuck open
+    expect(done.status).toBe('finalized');
+    expect(done.cycles).toHaveLength(1);
+    const c = done.cycles[0]!;
+    expect(c.kind).toBe('half');
+    expect(c.overload).toBe(true);
+    expect(c.mean).toBeCloseTo(400, 12);
+    expect(c.amplitude).toBeCloseTo(100, 12);
+    expect(c.damage).toBe(0.5); // half of the failure weight
+    expect(done.totalDamage).toBeCloseTo(0.5, 15);
+    store.close();
+  });
+
+  it('is chunk-invariant: point-by-point, random chunks and one block agree', () => {
+    const raw = [...BLOCK1, ...OVERLOAD_BLOCK, ...BLOCK3];
+    const config = cfg();
+    const ref = referencePipeline(raw, config);
+    expect(ref.finalized.some((c) => c.overload)).toBe(true);
+
+    const w = makeService();
+    const jw = w.service.createJob(config);
+    w.service.appendBlock(jw, 1, raw);
+    const whole = w.service.finalize(jw);
+    w.store.close();
+
+    const p = makeService();
+    const jp = p.service.createJob(config);
+    feedChunks(p.service, jp, raw, raw.map((_, i) => i + 1));
+    const pbp = p.service.finalize(jp);
+    p.store.close();
+
+    const c = makeService();
+    const jc = c.service.createJob(config);
+    feedChunks(c.service, jc, raw, randomCuts(mulberry32(424242), raw.length));
+    const chunked = c.service.finalize(jc);
+    c.store.close();
+
+    approxCycles(whole.cycles, ref.finalized);
+    approxCycles(pbp.cycles, ref.finalized);
+    approxCycles(chunked.cycles, ref.finalized);
+    const wantTotal = ref.finalized.reduce((s, x) => s + x.damage, 0);
+    expect(whole.totalDamage).toBeCloseTo(wantTotal, 9);
+    expect(pbp.totalDamage).toBeCloseTo(wantTotal, 9);
+    expect(chunked.totalDamage).toBeCloseTo(wantTotal, 9);
+  });
+
+  it('treats a re-sent overload block as idempotent, not an error', () => {
+    const { service, store } = makeService();
+    const id = service.createJob(cfg());
+    service.appendBlock(id, 1, BLOCK1);
+    service.appendBlock(id, 2, OVERLOAD_BLOCK);
+    const before = service.getResult(id);
+
+    const again = service.appendBlock(id, 2, OVERLOAD_BLOCK); // exact repeat
+    expect(again.cycles.length).toBe(before.cycles.length);
+    expect(again.totalDamage).toBeCloseTo(before.totalDamage, 15);
+    expect(again.blocks).toBe(2);
+    expect(again.lastSequence).toBe(2);
+
+    // same sequence with different content still conflicts
+    expect(() => service.appendBlock(id, 2, [1, 2, 3])).toThrow(ConflictError);
+    // and the stream moves on afterwards
+    service.appendBlock(id, 3, BLOCK3);
+    expect(service.getResult(id).lastSequence).toBe(3);
+    store.close();
+  });
+
+  it('resumes after a restart with the same result as an uninterrupted run', () => {
+    const { service, dbPath } = makeService();
+    const id = service.createJob(cfg());
+    service.appendBlock(id, 1, BLOCK1);
+    service.appendBlock(id, 2, OVERLOAD_BLOCK); // overload already ingested
+    service.store.close(); // "crash" with the job open
+
+    const store2 = new JobStore(dbPath);
+    const service2 = new JobService(store2);
+    service2.appendBlock(id, 3, BLOCK3);
+    const done = service2.finalize(id);
+
+    const plain = makeService();
+    const jid = plain.service.createJob(cfg());
+    plain.service.appendBlock(jid, 1, BLOCK1);
+    plain.service.appendBlock(jid, 2, OVERLOAD_BLOCK);
+    plain.service.appendBlock(jid, 3, BLOCK3);
+    const expected = plain.service.finalize(jid);
+    plain.store.close();
+
+    approxCycles(done.cycles, expected.cycles);
+    expect(done.totalDamage).toBeCloseTo(expected.totalDamage, 12);
+    expect(done.cycles.some((c) => c.overload)).toBe(true);
+    store2.close();
+  });
+
+  it('does not affect jobs without the Goodman correction', () => {
+    const { service, store } = makeService();
+    const id = service.createJob({ ...baseConfig, correction: 'none' }); // no UTS at all
+    service.appendBlock(id, 1, [450, 500, 450, 500, 450]);
+    const r = service.finalize(id);
+    expect(r.cycles.length).toBeGreaterThan(0);
+    for (const c of r.cycles) {
+      expect(c.overload).toBe(false);
+      expect(c.damage).toBeCloseTo((c.count * Math.pow(c.amplitude, 3)) / 1e12, 15);
+    }
+    store.close();
+  });
+
+  it('migrates a pre-overload-schema database in place', () => {
+    // Simulate the colleague's stuck database: current schema minus the
+    // overload column, holding only the blocks accepted before the upgrade.
+    const { service, store, dbPath } = makeService();
+    const id = service.createJob(cfg());
+    service.appendBlock(id, 1, BLOCK1);
+    store.close();
+    const raw = new Database(dbPath);
+    raw.exec('ALTER TABLE cycles DROP COLUMN overload');
+    raw.close();
+
+    // Reopening with the new binary adds the column; old rows read as
+    // non-overload (they could only be non-overload back then), and the
+    // previously rejected overload block now lands.
+    const store2 = new JobStore(dbPath);
+    const service2 = new JobService(store2);
+    const before = service2.getResult(id);
+    expect(before.cycles).toHaveLength(1);
+    expect(before.cycles[0]!.overload).toBe(false);
+    service2.appendBlock(id, 2, OVERLOAD_BLOCK);
+    const after = service2.finalize(id);
+    expect(after.cycles.some((c) => c.overload)).toBe(true);
+    expect(after.status).toBe('finalized');
+    store2.close();
   });
 });

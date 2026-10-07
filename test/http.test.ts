@@ -154,4 +154,84 @@ describe('HTTP API', () => {
     });
     expect(same.statusCode).toBe(200);
   });
+
+  it('accepts an overload block (Goodman mean >= UTS) instead of wedging the job', async () => {
+    const b = app();
+    const created = await b.app.inject({
+      method: 'POST',
+      url: '/jobs',
+      payload: { C: 1e12, m: 3, correction: 'goodman', ultimateTensileStrength: 400, hysteresis: 0 },
+    });
+    expect(created.statusCode).toBe(201);
+    const { jobId } = created.json() as { jobId: string };
+
+    const r1 = await b.app.inject({
+      method: 'POST',
+      url: `/jobs/${jobId}/blocks`,
+      payload: { sequence: 1, values: [0, 100, 0, 100, 0] },
+    });
+    expect(r1.statusCode).toBe(200);
+
+    // Cycles oscillating 450..500 have mean 475 >= UTS 400: the block lands.
+    const overloadBlock = [450, 500, 450, 500, 450, 0, 100];
+    const r2 = await b.app.inject({
+      method: 'POST',
+      url: `/jobs/${jobId}/blocks`,
+      payload: { sequence: 2, values: overloadBlock },
+    });
+    expect(r2.statusCode).toBe(200);
+    const body2 = r2.json();
+    const flagged = body2.cycles.filter((c: { overload: boolean }) => c.overload);
+    expect(flagged).toHaveLength(1);
+    expect(flagged[0].damage).toBe(1);
+    expect(flagged[0].mean).toBeCloseTo(475, 9);
+    expect(Number.isFinite(body2.totalDamage)).toBe(true);
+
+    // re-sending the accepted overload block is idempotent, not a 400/409
+    const again = await b.app.inject({
+      method: 'POST',
+      url: `/jobs/${jobId}/blocks`,
+      payload: { sequence: 2, values: overloadBlock },
+    });
+    expect(again.statusCode).toBe(200);
+    expect(again.json().cycles).toHaveLength(body2.cycles.length);
+
+    // the sequence stream keeps moving and the job finalizes
+    const r3 = await b.app.inject({
+      method: 'POST',
+      url: `/jobs/${jobId}/blocks`,
+      payload: { sequence: 3, values: [0, 50, 0] },
+    });
+    expect(r3.statusCode).toBe(200);
+    const fin = await b.app.inject({ method: 'POST', url: `/jobs/${jobId}/finalize` });
+    expect(fin.statusCode).toBe(200);
+    expect(fin.json().status).toBe('finalized');
+  });
+
+  it('finalizes when a residue half cycle overloads (mean exactly UTS)', async () => {
+    const b = app();
+    const created = await b.app.inject({
+      method: 'POST',
+      url: '/jobs',
+      payload: { C: 1e12, m: 3, correction: 'goodman', ultimateTensileStrength: 400, hysteresis: 0 },
+    });
+    const { jobId } = created.json() as { jobId: string };
+
+    const r1 = await b.app.inject({
+      method: 'POST',
+      url: `/jobs/${jobId}/blocks`,
+      payload: { sequence: 1, values: [300, 500] },
+    });
+    expect(r1.statusCode).toBe(200);
+
+    const fin = await b.app.inject({ method: 'POST', url: `/jobs/${jobId}/finalize` });
+    expect(fin.statusCode).toBe(200);
+    const done = fin.json();
+    expect(done.status).toBe('finalized');
+    expect(done.cycles).toHaveLength(1);
+    expect(done.cycles[0].kind).toBe('half');
+    expect(done.cycles[0].overload).toBe(true);
+    expect(done.cycles[0].damage).toBe(0.5);
+    expect(done.totalDamage).toBeCloseTo(0.5, 12);
+  });
 });

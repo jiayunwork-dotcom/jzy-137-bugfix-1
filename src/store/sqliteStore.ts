@@ -20,6 +20,8 @@ export interface StoredCycle {
   count: number;
   damage: number;
   kind: 'full' | 'half';
+  /** Goodman: mean met/exceeded UTS (static failure). See core/damage.ts. */
+  overload: boolean;
 }
 
 interface JobRow {
@@ -96,10 +98,21 @@ export class JobStore {
         mean REAL NOT NULL,
         count REAL NOT NULL,
         damage REAL NOT NULL,
-        kind TEXT NOT NULL CHECK (kind IN ('full','half'))
+        kind TEXT NOT NULL CHECK (kind IN ('full','half')),
+        overload INTEGER NOT NULL DEFAULT 0
       );
       CREATE INDEX IF NOT EXISTS idx_cycles_job ON cycles (job_id, seq);
     `);
+
+    // Databases written before the overload policy lack the column; add it in
+    // place. Every cycle such a database can hold is non-overload (overload
+    // blocks were rejected back then), so the 0 default is exact.
+    const cycleCols = this.db.prepare(`PRAGMA table_info(cycles)`).all() as Array<{
+      name: string;
+    }>;
+    if (!cycleCols.some((c) => c.name === 'overload')) {
+      this.db.exec(`ALTER TABLE cycles ADD COLUMN overload INTEGER NOT NULL DEFAULT 0`);
+    }
   }
 
   createJob(config: JobConfig): string {
@@ -246,8 +259,8 @@ export class JobStore {
         .run(args.jobId, args.sequence, args.checksum, args.pointCount);
 
       const insertCycle = this.db.prepare(
-        `INSERT INTO cycles (job_id, seq, amplitude, mean, count, damage, kind)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO cycles (job_id, seq, amplitude, mean, count, damage, kind, overload)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       );
       let seq = this.nextCycleSeq(args.jobId);
       const stored: StoredCycle[] = [];
@@ -260,6 +273,7 @@ export class JobStore {
           c.count,
           c.damage,
           c.kind,
+          c.overload ? 1 : 0,
         );
         stored.push({ id: Number(info.lastInsertRowid), seq, ...c });
         seq++;
@@ -305,13 +319,22 @@ export class JobStore {
         return this.listCycles(jobId);
       }
       const insertCycle = this.db.prepare(
-        `INSERT INTO cycles (job_id, seq, amplitude, mean, count, damage, kind)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO cycles (job_id, seq, amplitude, mean, count, damage, kind, overload)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       );
       let seq = this.nextCycleSeq(jobId);
       const stored: StoredCycle[] = [];
       for (const c of halfCycles) {
-        const info = insertCycle.run(jobId, seq, c.amplitude, c.mean, c.count, c.damage, c.kind);
+        const info = insertCycle.run(
+          jobId,
+          seq,
+          c.amplitude,
+          c.mean,
+          c.count,
+          c.damage,
+          c.kind,
+          c.overload ? 1 : 0,
+        );
         stored.push({ id: Number(info.lastInsertRowid), seq, ...c });
         seq++;
       }
@@ -326,12 +349,13 @@ export class JobStore {
   }
 
   listCycles(jobId: string): StoredCycle[] {
-    return this.db
+    const rows = this.db
       .prepare(
-        `SELECT id, amplitude, mean, count, damage, kind FROM cycles
+        `SELECT id, seq, amplitude, mean, count, damage, kind, overload FROM cycles
          WHERE job_id = ? ORDER BY seq ASC, id ASC`,
       )
-      .all(jobId) as StoredCycle[];
+      .all(jobId) as Array<Omit<StoredCycle, 'overload'> & { overload: number }>;
+    return rows.map((r) => ({ ...r, overload: r.overload === 1 }));
   }
 
   countBlocks(jobId: string): number {

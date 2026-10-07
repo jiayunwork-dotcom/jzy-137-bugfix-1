@@ -5,6 +5,7 @@ import {
   validateMaterial,
   sumDamage,
   scoreCycle,
+  isOverload,
 } from '../src/core/damage';
 import { RawCycle, offlineRainflow } from '../src/core/rainflow';
 import { Cycle } from '../src/core/types';
@@ -47,10 +48,37 @@ describe('Goodman mean-stress correction', () => {
     expect(effectiveAmplitude(100, 0, cfg)).toBe(100);
   });
 
-  it('raises when mean reaches the tensile strength', () => {
+  it('flags overload when the mean meets/exceeds the tensile strength', () => {
     const cfg = goodmanConfig(1000);
-    expect(() => effectiveAmplitude(100, 1000, cfg)).toThrow(ConfigError);
-    expect(() => effectiveAmplitude(100, 1200, cfg)).toThrow(ConfigError);
+    expect(isOverload(1000, cfg)).toBe(true); // exactly at UTS counts
+    expect(isOverload(1200, cfg)).toBe(true);
+    expect(isOverload(999.5, cfg)).toBe(false);
+    expect(isOverload(-5000, cfg)).toBe(false);
+    // without the Goodman correction nothing is ever an overload
+    expect(isOverload(1e9, baseConfig)).toBe(false);
+  });
+
+  it('scores an overload cycle instead of raising: damage = count weight', () => {
+    const cfg = goodmanConfig(1000);
+    // no finite effective amplitude exists, but nothing throws
+    expect(effectiveAmplitude(100, 1000, cfg)).toBe(Infinity);
+    expect(effectiveAmplitude(100, 1200, cfg)).toBe(Infinity);
+    // the Miner failure sum is 1: one overload full cycle exhausts the budget
+    expect(cycleDamage(100, 1000, 1, cfg)).toBe(1);
+    expect(cycleDamage(100, 1200, 0.5, cfg)).toBe(0.5);
+
+    const scored = scoreCycle({ range: 100, mean: 1200, count: 1, kind: 'full' }, cfg);
+    expect(scored.overload).toBe(true);
+    expect(scored.damage).toBe(1);
+    expect(scored.amplitude).toBe(50);
+    expect(scored.mean).toBe(1200);
+  });
+
+  it('leaves sub-UTS cycles untouched by the overload path', () => {
+    const cfg = goodmanConfig(1000);
+    const scored = scoreCycle({ range: 200, mean: 250, count: 1, kind: 'full' }, cfg);
+    expect(scored.overload).toBe(false);
+    expect(scored.damage).toBeCloseTo(Math.pow(100 / 0.75, 3) / 1e12, 15);
   });
 
   it('requires ultimateTensileStrength', () => {
